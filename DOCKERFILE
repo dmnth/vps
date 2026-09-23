@@ -1,0 +1,222 @@
+# syntax=docker/dockerfile:1.7
+#
+# IB Gateway in a browser-accessible desktop (Xvfb + XFCE + x11vnc + noVNC/HTTPS)
+#
+#   Build:  docker build -t ibgateway-novnc .
+#   Run:    docker run -d --name ibgateway --init \
+#             --env-file ibgw.env \
+#             -p 127.0.0.1:4444:4444 -p 127.0.0.1:7496:7496 \
+#             -v /path/on/host/with/installer:/installer:ro,z \
+#             -v ibgw-install:/opt/ibgateway -v ibgw-jts:/home/ibgw/Jts -v ibgw-tls:/home/ibgw/tls \
+#             ibgateway-novnc
+#
+#   Desktop:  https://<host>:4444/vnc.html
+#   API:      <host>:7496  (forwarded to the gateway's own API port, see IB_API_PORT)
+#
+# Needs BuildKit (Docker 23+ uses it by default) for the heredocs below.
+
+FROM almalinux:9
+
+# Java: "latest" (newest Temurin release), "lts" (newest LTS) or a feature number like 25
+ARG JAVA_VERSION=latest
+# jre or jdk
+ARG JAVA_IMAGE_TYPE=jre
+ARG UID=1000
+
+ENV LANG=C.UTF-8 \
+    DISPLAY=:1 \
+    JAVA_HOME=/opt/java \
+    PATH=/opt/java/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+
+# ---------------------------------------------------------------------------
+# Desktop stack: EPEL + CRB, Xvfb, x11vnc, noVNC web files, XFCE, plus the
+# libraries the IB Gateway GUI needs and socat for the API port.
+# ---------------------------------------------------------------------------
+RUN dnf install -y dnf-plugins-core \
+ && dnf config-manager --set-enabled crb \
+ && dnf install -y epel-release \
+ && dnf install -y --setopt=install_weak_deps=False \
+        xorg-x11-server-Xvfb xdpyinfo x11vnc novnc dbus-x11 xterm openssl \
+        python3 socat procps-ng tar gzip findutils which \
+        libXext libXrender libXtst libXi fontconfig dejavu-sans-fonts glibc-langpack-en \
+ && dnf groupinstall -y --setopt=install_weak_deps=False Xfce \
+ && dnf clean all && rm -rf /var/cache/dnf
+
+# websockify from PyPI in its own venv: the EPEL builds are too old for current
+# noVNC ("Client must support 'binary' or 'base64' protocol").
+RUN python3 -m venv /opt/websockify \
+ && /opt/websockify/bin/pip install --no-cache-dir --upgrade pip websockify \
+ && /opt/websockify/bin/websockify --help >/dev/null
+
+# ---------------------------------------------------------------------------
+# Latest Java (Eclipse Temurin) from the Adoptium API, checksum-verified.
+# Adoptium sometimes lists a version before its binaries exist, so fall back
+# to the next newest version that actually has a build.
+# ---------------------------------------------------------------------------
+RUN <<'EOF' bash
+set -euo pipefail
+case "$(uname -m)" in
+    x86_64)  arch=x64 ;;
+    aarch64) arch=aarch64 ;;
+    *) echo "Unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+read -r ver link sum < <(JAVA_VERSION="$JAVA_VERSION" ARCH="$arch" IMG="$JAVA_IMAGE_TYPE" python3 - <<'PY'
+import json, os, sys, urllib.error, urllib.request
+API = "https://api.adoptium.net/v3"
+def get(url):
+    with urllib.request.urlopen(url, timeout=30) as r:
+        return json.load(r)
+want = os.environ["JAVA_VERSION"]
+info = get(API + "/info/available_releases")
+if want == "latest":
+    candidates = sorted(info["available_releases"], reverse=True)
+elif want == "lts":
+    candidates = sorted(info["available_lts_releases"], reverse=True)
+else:
+    candidates = [int(want)]
+for v in candidates:
+    url = ("{0}/assets/latest/{1}/hotspot?os=linux&architecture={2}"
+           "&image_type={3}&vendor=eclipse").format(API, v, os.environ["ARCH"], os.environ["IMG"])
+    try:
+        assets = get(url)
+    except urllib.error.HTTPError:
+        assets = []
+    if assets:
+        pkg = assets[0]["binary"]["package"]
+        print(v, pkg["link"], pkg["checksum"])
+        sys.exit(0)
+    print("No Temurin {0} build for Java {1} yet, trying older".format(os.environ["IMG"], v), file=sys.stderr)
+sys.exit("No matching Temurin build found for JAVA_VERSION=" + want)
+PY
+)
+echo "Installing Temurin ${JAVA_IMAGE_TYPE} ${ver}: ${link}"
+curl -fsSL "$link" -o /tmp/java.tar.gz
+echo "${sum}  /tmp/java.tar.gz" | sha256sum -c -
+mkdir -p /opt/java
+tar -xzf /tmp/java.tar.gz -C /opt/java --strip-components=1
+rm -f /tmp/java.tar.gz
+java -version
+EOF
+
+# ---------------------------------------------------------------------------
+# Startup: same order as setup_x11_gui.py steps 2-4, plus IB Gateway + API port
+# ---------------------------------------------------------------------------
+COPY --chmod=755 <<'EOF' /usr/local/bin/start.sh
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RESOLUTION="${RESOLUTION:-1920x1080x24}"
+IB_DIR=/opt/ibgateway
+IB_API_PORT="${IB_API_PORT:-4001}"          # gateway's own API port: 4001 live, 4002 paper
+API_PORT=7496                               # exposed API port (forwarded to IB_API_PORT)
+TLS_DIR="$HOME/tls"
+PIDS=()
+# The gateway JVM: command line starts with a java binary and references $IB_DIR
+# (bundled JRE or Temurin). Anchored so shells that mention the path don't match.
+GW_MATCH="^[^ ]*/java .*$IB_DIR/"
+
+log() { printf '%s [start] %s\n' "$(date +%H:%M:%S)" "$*"; }
+die() { log "ERROR: $*"; exit 1; }
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+display_ok() { xdpyinfo -display :1 >/dev/null 2>&1; }
+wait_until() {   # wait_until <what> <cmd...>
+    local what="$1"; shift
+    for _ in $(seq 1 30); do "$@" && { log "$what ready"; return 0; }; sleep 0.5; done
+    die "$what did not start in time"
+}
+stop_all() {
+    trap - TERM INT
+    log "Stopping"
+    kill "${PIDS[@]}" 2>/dev/null || true
+    pkill -u "$(id -u)" -f "$GW_MATCH" 2>/dev/null || true
+    wait 2>/dev/null || true
+    exit "${1:-0}"
+}
+trap 'stop_all 0' TERM INT
+
+[[ -n "${VNC_PASSWORD:-}" ]] || die "VNC_PASSWORD is not set (use --env-file)"
+[[ "$IB_API_PORT" != "$API_PORT" ]] || die "IB_API_PORT must differ from $API_PORT (leave the gateway on 4001/4002)"
+if [[ "${IB_USE_SYSTEM_JAVA:-0}" == 1 ]]; then
+    export INSTALL4J_JAVA_HOME_OVERRIDE="$JAVA_HOME"   # run gateway on the Temurin JRE
+fi
+
+# --- IB Gateway: install from the host directory mounted at /installer ------
+installer="$(find /installer -maxdepth 1 -type f -name 'ibgateway*.sh' -printf '%T@ %p\n' 2>/dev/null \
+             | sort -nr | head -n1 | cut -d' ' -f2-)" || true
+if [[ -n "$installer" ]]; then
+    sum="$(sha256sum "$installer" | cut -d' ' -f1)"
+    if [[ "$(cat "$IB_DIR/.installer.sha256" 2>/dev/null)" != "$sum" || ! -x "$IB_DIR/ibgateway" ]]; then
+        log "Installing IB Gateway from $(basename "$installer")"
+        sh "$installer" -q -overwrite -dir "$IB_DIR" || die "IB Gateway installer failed"
+        echo "$sum" > "$IB_DIR/.installer.sha256"
+    fi
+fi
+[[ -x "$IB_DIR/ibgateway" ]] || die "No IB Gateway installed and no ibgateway*.sh found in /installer (mount it with -v HOSTDIR:/installer:ro)"
+
+# --- Step 2: Xvfb ------------------------------------------------------------
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+Xvfb :1 -screen 0 "$RESOLUTION" -nolisten tcp & PIDS+=($!)
+wait_until "Display :1" display_ok
+
+# --- Step 3: XFCE + x11vnc (localhost only, password required) ---------------
+dbus-launch --exit-with-session startxfce4 >/dev/null 2>&1 & PIDS+=($!)
+sleep 3
+mkdir -p "$HOME/.vnc"
+x11vnc -storepasswd "$VNC_PASSWORD" "$HOME/.vnc/passwd" >/dev/null
+x11vnc -display :1 -localhost -rfbport 5900 -rfbauth "$HOME/.vnc/passwd" \
+       -forever -shared -xkb -quiet & PIDS+=($!)
+wait_until "x11vnc on 5900" port_open 5900
+
+# --- Step 4: noVNC over HTTPS on 4444 (self-signed cert, generated once) ----
+mkdir -p "$TLS_DIR"
+if ! openssl x509 -checkend 86400 -noout -in "$TLS_DIR/cert.pem" >/dev/null 2>&1; then
+    san="DNS:localhost,IP:127.0.0.1${PUBLIC_HOST:+,$( [[ "$PUBLIC_HOST" =~ ^[0-9.]+$ ]] && echo IP || echo DNS ):$PUBLIC_HOST}"
+    (umask 077; openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 365 \
+        -subj "/CN=${PUBLIC_HOST:-localhost}" -addext "subjectAltName=$san" \
+        -keyout "$TLS_DIR/key.pem" -out "$TLS_DIR/cert.pem" 2>/dev/null)
+    log "Generated TLS certificate ($san)"
+fi
+/opt/websockify/bin/websockify --web /usr/share/novnc \
+    --cert "$TLS_DIR/cert.pem" --key "$TLS_DIR/key.pem" --ssl-only \
+    4444 localhost:5900 & PIDS+=($!)
+wait_until "noVNC on 4444" port_open 4444
+
+# --- API port: 7496 -> gateway, so clients arrive as localhost ---------------
+socat TCP-LISTEN:"$API_PORT",fork,reuseaddr TCP:127.0.0.1:"$IB_API_PORT" & PIDS+=($!)
+
+# --- IB Gateway on the desktop (relaunched if it exits) ----------------------
+(
+    while true; do
+        if ! pgrep -u "$(id -u)" -f "$GW_MATCH" >/dev/null; then
+            log "Starting IB Gateway"
+            "$IB_DIR/ibgateway" || true
+        fi
+        sleep 10
+    done
+) & PIDS+=($!)
+
+log "Ready: desktop https://<host>:4444/vnc.html | API <host>:$API_PORT -> 127.0.0.1:$IB_API_PORT"
+
+# Exit (and let the restart policy take over) if a core service dies
+wait -n "${PIDS[@]}" || true
+log "A service exited unexpectedly"
+stop_all 1
+EOF
+
+# ---------------------------------------------------------------------------
+# Unprivileged runtime user and persistent locations
+# ---------------------------------------------------------------------------
+RUN useradd -m -u "${UID}" -s /bin/bash ibgw \
+ && mkdir -p /opt/ibgateway /installer /home/ibgw/Jts /home/ibgw/tls \
+ && chown -R ibgw:ibgw /opt/ibgateway /home/ibgw
+
+USER ibgw
+WORKDIR /home/ibgw
+
+# 4444 = remote desktop (noVNC over HTTPS), 7496 = IB API
+EXPOSE 4444 7496
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD bash -c 'exec 3<>/dev/tcp/127.0.0.1/4444'
+
+ENTRYPOINT ["/usr/local/bin/start.sh"]
